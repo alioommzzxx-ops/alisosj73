@@ -237,6 +237,23 @@ const LS = {
   del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
   keys() { try { return Object.keys(localStorage); } catch { return []; } },
 };
+/* ═════ إعدادات صاحب المنصة: عدّلها أنت فقط، والمستخدمون لا يرونها ═════
+   لتشغيل المنصة للمستخدمين بدون أي مفتاح: افتح الصفحة بإضافة  #/owner  لرابطها واتبع الشرح. */
+const OWNER = {
+  proxyUrl: '',    // رابط Cloudflare Worker (الطريقة الآمنة الموصى بها)
+  geminiKey: 'AQ.Ab8RN6I80i1ypiL5KyE5ydUtTjsXSY5-nIxeWtQQybZGn2E4xw',   // بديل أسرع لكنه أقل أماناً: مفتاح Gemini يظهر لكل من يفحص الصفحة
+  model: '',       // اختياري، يُستخدم مع geminiKey فقط
+  dailyLimit: 10,  // عدد عمليات الإنشاء لكل مستخدم باليوم (0 = بلا حد)
+};
+const builtIn = () => !!(OWNER.proxyUrl || OWNER.geminiKey);
+function checkDailyLimit() {
+  if (!builtIn() || !OWNER.dailyLimit) return;
+  const today = new Date().toISOString().slice(0, 10);
+  let rec; try { rec = JSON.parse(LS.get('masna_day', '{}')); } catch { rec = {}; }
+  if (rec.d !== today) rec = { d: today, n: 0 };
+  if (rec.n >= OWNER.dailyLimit) throw new Error(`وصلت للحد اليومي (${OWNER.dailyLimit} عمليات). عُد غداً بإذن الله.`);
+  rec.n++; LS.set('masna_day', JSON.stringify(rec));
+}
 const PROVIDERS = {
   gemini: { label: 'Google Gemini (مجاني)', short: 'Gemini', keyName: 'masna_key_gemini', modelName: 'masna_model_gemini', defModel: 'gemini-flash-latest', ph: 'AIza…' },
   anthropic: { label: 'Anthropic Claude (مدفوع)', short: 'Anthropic', keyName: 'masna_key', modelName: 'masna_model', defModel: 'claude-sonnet-5-5', ph: 'sk-ant-…' },
@@ -390,6 +407,10 @@ async function geminiError(r) {
   let detail = '';
   try { const j = await r.json(); detail = (j.error && j.error.message) || ''; } catch { /* ignore */ }
   const s = r.status;
+  if (builtIn()) {
+    if (s === 429) return new Error('وصلت المنصة لحد الاستخدام المجاني حالياً. حاول بعد دقائق أو غداً.');
+    if (s === 400 || s === 403 || s === 404) return new Error('تعذّر الإنشاء بسبب إعداد المنصة، أبلغ صاحبها.' + (detail ? ' (' + detail.slice(0, 120) + ')' : ''));
+  }
   if (/location|region|not supported/i.test(detail)) return new Error('خدمة Gemini غير متاحة في منطقتك حالياً: ' + detail);
   if (s === 400 && /api key|API_KEY/i.test(detail)) return new Error('مفتاح Gemini غير صحيح. أنشئ مفتاحاً جديداً من aistudio.google.com/apikey وألصقه في «الإعدادات».');
   if (s === 403) return new Error('رفض Gemini المفتاح أو الخدمة غير متاحة لحسابك' + (detail ? ': ' + detail : '.'));
@@ -418,14 +439,19 @@ async function readSse(r, onEvent) {
 }
 
 async function streamGemini(user, signal, onDelta) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model())}:streamGenerateContent?alt=sse`;
+  let url, payload;
+  const headers = { 'content-type': 'application/json' };
+  if (OWNER.proxyUrl) { url = OWNER.proxyUrl; payload = { system: SYSTEM, user }; }
+  else {
+    const model = OWNER.geminiKey ? (OWNER.model || PROVIDERS.gemini.defModel) : cfg.model();
+    url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+    headers['x-goog-api-key'] = OWNER.geminiKey || cfg.key();
+    payload = { systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { maxOutputTokens: 32768 } };
+  }
   let r;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      r = await fetch(url, {
-        method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.key() },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { maxOutputTokens: 32768 } }),
-      });
+      r = await fetch(url, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
     } catch (e) { if (e.name === 'AbortError') throw e; throw new Error('تعذّر الاتصال بـ Gemini. تحقق من الإنترنت.'); }
     if (r.ok) break;
     if (attempt === 0 && r.status >= 500) { await new Promise(res => setTimeout(res, 2500)); continue; }
@@ -468,13 +494,14 @@ async function streamAnthropic(user, signal, onDelta) {
 }
 
 async function streamGenerate(prompt, projectId, onEvent, signal) {
-  if (!cfg.key()) { openSettings(); throw new Error('أضف مفتاح ' + cfg.P().short + ' من «الإعدادات» أولاً.'); }
+  if (!builtIn() && !cfg.key()) { openSettings(); throw new Error('أضف مفتاح ' + cfg.P().short + ' من «الإعدادات» أولاً.'); }
   let project = null;
   if (projectId) {
     project = loadProject(projectId);
     if (!project) throw new Error('المشروع غير موجود.');
     if (Object.values(project.files).reduce((n, c) => n + c.length, 0) > MAX_CONTEXT_CHARS) throw new Error('المشروع كبير جداً للتعديل بالمحادثة. عدّل الملفات يدوياً من تبويب الملفات.');
   }
+  checkDailyLimit();
   let full = '', scanFrom = 0, lastTick = 0;
   const seen = new Set();
   const headerRe = /^===FILE:[ \t]*(.+?)[ \t]*===/gm;
@@ -485,7 +512,7 @@ async function streamGenerate(prompt, projectId, onEvent, signal) {
   };
   const user = buildUserContent(prompt, project);
   const onDelta = t => { full += t; const now = Date.now(); if (now - lastTick > 250) { lastTick = now; scan(); } };
-  const stop = await (cfg.provider() === 'gemini' ? streamGemini(user, signal, onDelta) : streamAnthropic(user, signal, onDelta));
+  const stop = await ((builtIn() || cfg.provider() === 'gemini') ? streamGemini(user, signal, onDelta) : streamAnthropic(user, signal, onDelta));
   scan();
 
   const out = parseOutput(full), notes = [];
@@ -570,6 +597,7 @@ function route() {
   const hash = location.hash || '#/';
   if (hash.startsWith('#/p/')) openProject(hash.slice(4));
   else if (hash === '#/projects') renderProjects();
+  else if (hash === '#/owner') { showView('home'); showOwnerGuide(); }
   else showView('home');
 }
 window.addEventListener('hashchange', route);
@@ -1023,10 +1051,89 @@ function showPublishGuide() {
   ]);
 }
 
+/* ═════════ دليل صاحب المنصة: مستخدمون بدون مفتاح ═════════ */
+const WORKER_CODE = `export default {
+  async fetch(request, env) {
+    const origin = request.headers.get('Origin') || '';
+    const allowed = String(env.ALLOWED_ORIGINS || '*').split(',').map(function (s) { return s.trim(); });
+    const okOrigin = allowed.indexOf('*') !== -1 || allowed.indexOf(origin) !== -1;
+    const cors = {
+      'Access-Control-Allow-Origin': okOrigin ? (origin || '*') : 'null',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'content-type',
+      'Access-Control-Max-Age': '86400',
+      'Vary': 'Origin'
+    };
+    const fail = function (status, message) {
+      return new Response(JSON.stringify({ error: { message: message } }), {
+        status: status,
+        headers: Object.assign({ 'Content-Type': 'application/json' }, cors)
+      });
+    };
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (request.method !== 'POST') return fail(405, 'method not allowed');
+    if (!okOrigin) return fail(403, 'origin not allowed');
+    if (!env.GEMINI_KEY) return fail(500, 'GEMINI_KEY is not set');
+    let body;
+    try { body = await request.json(); } catch (e) { return fail(400, 'bad json'); }
+    const system = String(body.system || '').slice(0, 20000);
+    const user = String(body.user || '');
+    if (user.length < 4 || user.length > 300000) return fail(413, 'bad size');
+    const model = env.MODEL || 'gemini-flash-latest';
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':streamGenerateContent?alt=sse';
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: 'user', parts: [{ text: user }] }],
+        generationConfig: { maxOutputTokens: 32768 }
+      })
+    });
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: Object.assign({
+        'Content-Type': upstream.headers.get('content-type') || 'text/event-stream',
+        'Cache-Control': 'no-store'
+      }, cors)
+    });
+  }
+};
+`;
+function copyText(t) {
+  const done = () => toast('تم النسخ', 'ok');
+  const fallback = () => {
+    const ta = h('textarea', { style: 'position:fixed;opacity:0' }); ta.value = t; document.body.append(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch { toast('تعذّر النسخ، حدّد النص يدوياً.', 'err'); }
+    ta.remove();
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, fallback); else fallback();
+}
+let ownerOpen = false;
+function showOwnerGuide() {
+  if (ownerOpen) return;
+  ownerOpen = true;
+  const step = (n, t, d) => h('div', { class: 'guide-step' }, h('div', { class: 'guide-num' }, String(n)), h('div', null, h('b', null, t), h('span', null, d)));
+  const m = modal([
+    h('h3', null, 'تشغيل المنصة للمستخدمين بدون مفتاح'),
+    h('div', { class: 'p-meta' }, 'الفكرة: مفتاحك يبقى سرياً داخل «وسيط» مجاني على Cloudflare، والصفحة تتصل بالوسيط بدل أن تحمل المفتاح. المستخدم يدخل ويكتب فكرته مباشرة.'),
+    step(1, 'أنشئ مفتاح Gemini المجاني', ['من ', h('code', null, 'aistudio.google.com/apikey'), ' واضغط Create API key، وانسخه.']),
+    step(2, 'أنشئ الوسيط على Cloudflare', ['سجّل مجاناً في ', h('code', null, 'dash.cloudflare.com'), ' ثم Workers & Pages ← Create ← Create Worker، سمّه مثل masna-proxy واضغط Deploy، ثم Edit code واحذف كل ما فيه والصق الكود أدناه، ثم Deploy.']),
+    h('pre', { style: 'direction:ltr;text-align:left;background:var(--bg);padding:10px;border-radius:10px;overflow:auto;max-height:200px;font-size:12px;font-family:var(--mono);white-space:pre;margin:6px 0' }, WORKER_CODE),
+    h('button', { class: 'btn sm', type: 'button', onclick: () => copyText(WORKER_CODE) }, 'نسخ كود الوسيط'),
+    step(3, 'أضف المفتاح للوسيط', ['في صفحة الـ Worker: Settings ← Variables and Secrets ← Add. أضف متغيراً من نوع Secret اسمه ', h('code', null, 'GEMINI_KEY'), ' وقيمته مفتاحك. وأضف متغيراً نصياً ', h('code', null, 'ALLOWED_ORIGINS'), ' قيمته رابط موقعك مثل ', h('code', null, 'https://اسمك.github.io'), ' (بدون / في النهاية) حتى لا تعمل إلا من موقعك. ثم Deploy.']),
+    step(4, 'انسخ رابط الوسيط', ['ينتهي بـ ', h('code', null, 'workers.dev'), ' ويظهر أعلى صفحة الـ Worker.']),
+    step(5, 'ضع الرابط في index.html', ['افتح الملف في مستودعك على GitHub واضغط أيقونة القلم، وابحث عن ', h('code', null, "proxyUrl: ''"), ' وضع الرابط بين علامتي الاقتباس، ثم Commit changes. بعد دقيقة يعمل الموقع بدون مفتاح عند المستخدمين.']),
+    h('div', { class: 'guide-tip' }, 'الحد المجاني لـ Gemini مشترك بين كل مستخدميك. تحكّم بعدد العمليات لكل مستخدم من dailyLimit في نفس الملف (الافتراضي 10 باليوم)، وإذا استُهلك الحد تظهر للمستخدم رسالة لطيفة.'),
+    h('div', { class: 'guide-tip' }, 'بديل أسرع وأقل أماناً: ضع مفتاح Gemini مباشرة في geminiKey. لكنه سيظهر لأي شخص يفحص الصفحة. إن فعلت، قيّد المفتاح بموقعك من Google AI Studio أو Google Cloud (قيود HTTP referrers).'),
+    h('button', { class: 'btn primary', type: 'button', style: 'margin-top:12px', onclick: () => { m.close(); ownerOpen = false; } }, 'تمام'),
+  ]);
+}
+
 /* ═════════ الإعدادات واختبار الاتصال ═════════ */
 function updateKeyWarn() {
   const w = $('#key-warn');
-  if (cfg.key()) { w.classList.add('hidden'); return; }
+  if (builtIn() || cfg.key()) { w.classList.add('hidden'); return; }
   w.classList.remove('hidden');
   w.textContent = 'لم تضف مفتاح ' + cfg.P().short + ' بعد. اضغط هنا (أو «الإعدادات» بالأعلى) لإضافته، وبدونه لا يعمل الإنشاء.';
   w.style.cursor = 'pointer';
@@ -1095,6 +1202,7 @@ function openSettings() {
     h('label', { class: 'p-meta' }, 'النموذج (اتركه فارغاً للافتراضي)'), modelInp,
     help,
     h('div', { class: 'p-meta' }, 'يُحفظ المفتاح على هذا الجهاز فقط ويُرسل مباشرة إلى المزوّد. لا تستخدم هذه الصفحة على جهاز لا تثق به، ولا تشارك نسخة تحتوي مفتاحك.'),
+    h('button', { class: 'btn ghost sm', type: 'button', onclick: () => { m.close(); settingsOpen = false; showOwnerGuide(); } }, 'أنا صاحب المنصة: أريد المستخدمين بدون مفتاح'),
     out,
     h('div', { style: 'display:flex;gap:8px;margin-top:12px;flex-wrap:wrap' },
       h('button', { class: 'btn primary', type: 'button', onclick: () => { if (persist()) toast('تم حفظ الإعدادات', 'ok'); } }, 'حفظ'),
@@ -1109,8 +1217,9 @@ $('#btn-guide-home').addEventListener('click', showPublishGuide);
 (function init() {
   initHome();
   updateKeyWarn();
+  if (builtIn()) $('#btn-health').classList.add('hidden');
   route();
-  if (!cfg.key()) setTimeout(openSettings, 500);
+  if (!builtIn() && !cfg.key() && location.hash !== '#/owner') setTimeout(openSettings, 500);
 })();
 </script>
 </body>
