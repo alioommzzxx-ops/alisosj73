@@ -230,8 +230,16 @@ const LS = {
   del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
   keys() { try { return Object.keys(localStorage); } catch { return []; } },
 };
-const DEFAULT_MODEL = 'claude-sonnet-5-5';
-const cfg = { key: () => LS.get('masna_key').trim(), model: () => LS.get('masna_model').trim() || DEFAULT_MODEL };
+const PROVIDERS = {
+  gemini: { label: 'Google Gemini (مجاني)', short: 'Gemini', keyName: 'masna_key_gemini', modelName: 'masna_model_gemini', defModel: 'gemini-flash-latest', ph: 'AIza…' },
+  anthropic: { label: 'Anthropic Claude (مدفوع)', short: 'Anthropic', keyName: 'masna_key', modelName: 'masna_model', defModel: 'claude-sonnet-5-5', ph: 'sk-ant-…' },
+};
+const cfg = {
+  provider() { return LS.get('masna_provider') === 'anthropic' ? 'anthropic' : 'gemini'; },
+  P() { return PROVIDERS[this.provider()]; },
+  key() { return LS.get(this.P().keyName).trim(); },
+  model() { return LS.get(this.P().modelName).trim() || this.P().defModel; },
+};
 const MAX_TOKENS = 32000, MAX_FILES = 40, MAX_FILE_CHARS = 400000, MAX_CONTEXT_CHARS = 250000;
 const ALLOWED_EXT = new Set(['html', 'css', 'js', 'json', 'svg', 'txt', 'md']);
 const PATH_RE = /^[\w\-.\u0600-\u06FF]+(\/[\w\-.\u0600-\u06FF]+)*$/;
@@ -371,21 +379,71 @@ function buildUserContent(prompt, project) {
   return parts.join('\n\n');
 }
 
-async function streamGenerate(prompt, projectId, onEvent, signal) {
-  const key = cfg.key();
-  if (!key) { openSettings(); throw new Error('أضف مفتاح Anthropic من «الإعدادات» أولاً.'); }
-  let project = null;
-  if (projectId) {
-    project = loadProject(projectId);
-    if (!project) throw new Error('المشروع غير موجود.');
-    if (Object.values(project.files).reduce((n, c) => n + c.length, 0) > MAX_CONTEXT_CHARS) throw new Error('المشروع كبير جداً للتعديل بالمحادثة. عدّل الملفات يدوياً من تبويب الملفات.');
+async function geminiError(r) {
+  let detail = '';
+  try { const j = await r.json(); detail = (j.error && j.error.message) || ''; } catch { /* ignore */ }
+  const s = r.status;
+  if (/location|region|not supported/i.test(detail)) return new Error('خدمة Gemini غير متاحة في منطقتك حالياً: ' + detail);
+  if (s === 400 && /api key|API_KEY/i.test(detail)) return new Error('مفتاح Gemini غير صحيح. أنشئ مفتاحاً جديداً من aistudio.google.com/apikey وألصقه في «الإعدادات».');
+  if (s === 403) return new Error('رفض Gemini المفتاح أو الخدمة غير متاحة لحسابك' + (detail ? ': ' + detail : '.'));
+  if (s === 404) return new Error(`النموذج «${cfg.model()}» غير متاح. غيّره من «الإعدادات» (اتركه فارغاً للافتراضي).`);
+  if (s === 429) return new Error('وصلت لحد الاستخدام المجاني (طلبات بالدقيقة أو باليوم). انتظر دقيقة وأعد المحاولة، وإن تكرر فجرّب غداً.');
+  if (s >= 500) return new Error('خوادم Gemini مشغولة الآن. أعد المحاولة بعد قليل.');
+  return new Error('رفض Gemini الطلب' + (detail ? ': ' + detail : '.'));
+}
+
+async function readSse(r, onEvent) {
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+    let i;
+    while ((i = buf.indexOf('\n\n')) !== -1) {
+      const block = buf.slice(0, i); buf = buf.slice(i + 2);
+      const line = block.split('\n').find(l => l.startsWith('data:'));
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+      onEvent(ev);
+    }
   }
+}
+
+async function streamGemini(user, signal, onDelta) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model())}:streamGenerateContent?alt=sse`;
+  let r;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      r = await fetch(url, {
+        method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.key() },
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { maxOutputTokens: 32768 } }),
+      });
+    } catch (e) { if (e.name === 'AbortError') throw e; throw new Error('تعذّر الاتصال بـ Gemini. تحقق من الإنترنت.'); }
+    if (r.ok) break;
+    if (attempt === 0 && r.status >= 500) { await new Promise(res => setTimeout(res, 2500)); continue; }
+    break;
+  }
+  if (!r.ok) throw await geminiError(r);
+  let fin = null;
+  await readSse(r, ev => {
+    if (ev.error) throw new Error('انقطع الإنشاء من جهة Gemini: ' + (ev.error.message || 'خطأ غير معروف'));
+    if (ev.promptFeedback && ev.promptFeedback.blockReason) throw new Error('رفض Gemini الطلب لأسباب أمان (' + ev.promptFeedback.blockReason + '). أعد صياغة الفكرة.');
+    const c = ev.candidates && ev.candidates[0];
+    if (!c) return;
+    for (const part of (c.content && c.content.parts) || []) if (part.text && !part.thought) onDelta(part.text);
+    if (c.finishReason && c.finishReason !== 'STOP') fin = c.finishReason;
+  });
+  return fin === 'MAX_TOKENS' ? 'max_tokens' : null;
+}
+
+async function streamAnthropic(user, signal, onDelta) {
   let r;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       r = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST', signal, headers: apiHeaders(key),
-        body: JSON.stringify({ model: cfg.model(), max_tokens: MAX_TOKENS, stream: true, system: SYSTEM, messages: [{ role: 'user', content: buildUserContent(prompt, project) }] }),
+        method: 'POST', signal, headers: apiHeaders(cfg.key()),
+        body: JSON.stringify({ model: cfg.model(), max_tokens: MAX_TOKENS, stream: true, system: SYSTEM, messages: [{ role: 'user', content: user }] }),
       });
     } catch (e) { if (e.name === 'AbortError') throw e; throw new Error('تعذّر الاتصال بـ Anthropic. تحقق من الإنترنت.'); }
     if (r.ok) break;
@@ -393,9 +451,24 @@ async function streamGenerate(prompt, projectId, onEvent, signal) {
     break;
   }
   if (!r.ok) throw await apiError(r);
+  let stop = null;
+  await readSse(r, ev => {
+    if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') onDelta(ev.delta.text);
+    else if (ev.type === 'message_delta' && ev.delta && ev.delta.stop_reason) stop = ev.delta.stop_reason;
+    else if (ev.type === 'error') throw new Error('انقطع الإنشاء من جهة Anthropic: ' + ((ev.error && ev.error.message) || 'خطأ غير معروف'));
+  });
+  return stop;
+}
 
-  const reader = r.body.getReader(), dec = new TextDecoder();
-  let buf = '', full = '', stop = null, scanFrom = 0, lastTick = 0;
+async function streamGenerate(prompt, projectId, onEvent, signal) {
+  if (!cfg.key()) { openSettings(); throw new Error('أضف مفتاح ' + cfg.P().short + ' من «الإعدادات» أولاً.'); }
+  let project = null;
+  if (projectId) {
+    project = loadProject(projectId);
+    if (!project) throw new Error('المشروع غير موجود.');
+    if (Object.values(project.files).reduce((n, c) => n + c.length, 0) > MAX_CONTEXT_CHARS) throw new Error('المشروع كبير جداً للتعديل بالمحادثة. عدّل الملفات يدوياً من تبويب الملفات.');
+  }
+  let full = '', scanFrom = 0, lastTick = 0;
   const seen = new Set();
   const headerRe = /^===FILE:[ \t]*(.+?)[ \t]*===/gm;
   const scan = () => {
@@ -403,23 +476,9 @@ async function streamGenerate(prompt, projectId, onEvent, signal) {
     while ((m = headerRe.exec(full))) { scanFrom = headerRe.lastIndex; const p = m[1].trim(); if (!seen.has(p)) { seen.add(p); onEvent({ type: 'file', path: p }); } }
     onEvent({ type: 'progress', chars: full.length });
   };
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf('\n\n')) !== -1) {
-      const block = buf.slice(0, i); buf = buf.slice(i + 2);
-      const line = block.split('\n').find(l => l.startsWith('data:'));
-      if (!line) continue;
-      let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
-      if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') {
-        full += ev.delta.text;
-        const now = Date.now(); if (now - lastTick > 250) { lastTick = now; scan(); }
-      } else if (ev.type === 'message_delta' && ev.delta && ev.delta.stop_reason) stop = ev.delta.stop_reason;
-      else if (ev.type === 'error') throw new Error('انقطع الإنشاء من جهة Anthropic: ' + ((ev.error && ev.error.message) || 'خطأ غير معروف'));
-    }
-  }
+  const user = buildUserContent(prompt, project);
+  const onDelta = t => { full += t; const now = Date.now(); if (now - lastTick > 250) { lastTick = now; scan(); } };
+  const stop = await (cfg.provider() === 'gemini' ? streamGemini(user, signal, onDelta) : streamAnthropic(user, signal, onDelta));
   scan();
 
   const out = parseOutput(full), notes = [];
@@ -939,24 +998,35 @@ function updateKeyWarn() {
   const w = $('#key-warn');
   if (cfg.key()) { w.classList.add('hidden'); return; }
   w.classList.remove('hidden');
-  w.textContent = 'لم تضف مفتاح Anthropic بعد. اضغط هنا (أو «الإعدادات» بالأعلى) لإضافته، وبدونه لا يعمل الإنشاء.';
+  w.textContent = 'لم تضف مفتاح ' + cfg.P().short + ' بعد. اضغط هنا (أو «الإعدادات» بالأعلى) لإضافته، وبدونه لا يعمل الإنشاء.';
   w.style.cursor = 'pointer';
   w.onclick = () => openSettings();
 }
-async function testConnection(key, out) {
-  out.className = 'p-meta'; out.replaceChildren('جاري الاختبار الفعلي مع Anthropic…');
-  const model = cfg.model();
+async function testConnection(out) {
+  out.className = 'p-meta'; out.replaceChildren('جاري الاختبار الفعلي…');
+  const model = cfg.model(), key = cfg.key(), gem = cfg.provider() === 'gemini';
   let models = [];
   try {
-    const m = await fetch('https://api.anthropic.com/v1/models?limit=100', { headers: apiHeaders(key) });
-    if (m.ok) models = ((await m.json()).data || []).map(x => x.id);
-    else if (m.status === 401) throw await apiError(m);
-    const t = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: apiHeaders(key), body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'ping' }] }) });
-    if (t.ok) { out.className = 'notice ok'; out.replaceChildren(`الاتصال سليم ✓ النموذج المستخدم: ${model}`); }
-    else { const e = await apiError(t); out.className = 'notice ' + (t.status === 404 ? '' : 'err'); out.replaceChildren(e.message); }
+    let t, err;
+    if (gem) {
+      const base = 'https://generativelanguage.googleapis.com/v1beta/models';
+      const m = await fetch(base + '?pageSize=200', { headers: { 'x-goog-api-key': key } });
+      if (!m.ok) throw await geminiError(m);
+      models = ((await m.json()).models || []).filter(x => (x.supportedGenerationMethods || []).includes('generateContent')).map(x => x.name.replace(/^models\//, ''));
+      t = await fetch(`${base}/${encodeURIComponent(model)}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'ping' }] }], generationConfig: { maxOutputTokens: 16 } }) });
+      if (!t.ok) err = await geminiError(t);
+    } else {
+      const m = await fetch('https://api.anthropic.com/v1/models?limit=100', { headers: apiHeaders(key) });
+      if (m.ok) models = ((await m.json()).data || []).map(x => x.id);
+      else if (m.status === 401) throw await apiError(m);
+      t = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: apiHeaders(key), body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'ping' }] }) });
+      if (!t.ok) err = await apiError(t);
+    }
+    if (!err) { out.className = 'notice ok'; out.replaceChildren(`الاتصال سليم ✓ المزوّد: ${cfg.P().short} | النموذج: ${model}`); }
+    else { out.className = 'notice ' + (t.status === 404 ? '' : 'err'); out.replaceChildren(err.message); }
   } catch (e) {
     out.className = 'notice err';
-    out.replaceChildren(e instanceof TypeError ? 'تعذّر الوصول إلى Anthropic. تحقق من الإنترنت.' : e.message);
+    out.replaceChildren(e instanceof TypeError ? 'تعذّر الوصول إلى الخدمة. تحقق من الإنترنت.' : e.message);
   }
   if (models.length) out.append(h('div', { class: 'models' }, models.join('\n')));
 }
@@ -964,26 +1034,41 @@ let settingsOpen = false;
 function openSettings() {
   if (settingsOpen) return;
   settingsOpen = true;
-  const keyInp = h('input', { class: 'inp', type: 'password', placeholder: 'sk-ant-…', autocomplete: 'off', spellcheck: 'false', value: cfg.key(), style: 'direction:ltr;text-align:left' });
-  const modelInp = h('input', { class: 'inp', type: 'text', placeholder: DEFAULT_MODEL, autocomplete: 'off', spellcheck: 'false', value: LS.get('masna_model'), style: 'direction:ltr;text-align:left' });
+  const sel = h('select', { class: 'inp', 'aria-label': 'المزوّد' }, ...Object.entries(PROVIDERS).map(([id, P]) => h('option', { value: id, selected: id === cfg.provider() }, P.label)));
+  const keyLabel = h('label', { class: 'p-meta' });
+  const keyInp = h('input', { class: 'inp', type: 'password', autocomplete: 'off', spellcheck: 'false', style: 'direction:ltr;text-align:left' });
+  const modelInp = h('input', { class: 'inp', type: 'text', autocomplete: 'off', spellcheck: 'false', style: 'direction:ltr;text-align:left' });
+  const help = h('div', { class: 'p-meta', style: 'line-height:1.9' });
   const out = h('div', { class: 'p-meta' });
+  const fill = () => {
+    const P = PROVIDERS[sel.value];
+    keyInp.value = LS.get(P.keyName); modelInp.value = LS.get(P.modelName);
+    keyInp.placeholder = P.ph; modelInp.placeholder = P.defModel;
+    keyLabel.textContent = 'مفتاح ' + P.short;
+    help.textContent = sel.value === 'gemini'
+      ? 'مجاني بدون بطاقة: ادخل aistudio.google.com/apikey وسجّل بحساب Google واضغط Create API key. للاستخدام المجاني حدود على عدد الطلبات بالدقيقة واليوم، وقد تستخدم Google ما ترسله لتحسين منتجاتها، فلا تكتب بيانات سرية.'
+      : 'مدفوع: أنشئ مفتاحاً من console.anthropic.com ← API Keys، واشحن رصيداً من Plans & Billing.';
+    out.replaceChildren(); out.className = 'p-meta';
+  };
+  sel.addEventListener('change', fill); fill();
   const persist = () => {
-    const ok1 = LS.set('masna_key', keyInp.value.trim()), ok2 = LS.set('masna_model', modelInp.value.trim());
-    if (!ok1 || !ok2) { toast('تعذّر الحفظ: التخزين المحلي معطّل في متصفحك.', 'err'); return false; }
+    const P = PROVIDERS[sel.value];
+    const ok = LS.set('masna_provider', sel.value) && LS.set(P.keyName, keyInp.value.trim()) && LS.set(P.modelName, modelInp.value.trim());
+    if (!ok) { toast('تعذّر الحفظ: التخزين المحلي معطّل في متصفحك.', 'err'); return false; }
     updateKeyWarn(); return true;
   };
   const m = modal([
     h('h3', null, 'الإعدادات'),
-    h('label', { class: 'p-meta' }, 'مفتاح Anthropic API'),
-    keyInp,
-    h('button', { class: 'btn ghost sm', type: 'button', onclick: e => { const s = keyInp.type === 'password'; keyInp.type = s ? 'text' : 'password'; e.target.textContent = s ? 'إخفاء المفتاح' : 'إظهار المفتاح'; } }, 'إظهار المفتاح'),
-    h('label', { class: 'p-meta' }, 'النموذج (اتركه فارغاً للافتراضي)'),
-    modelInp,
-    h('div', { class: 'p-meta' }, 'يُحفظ المفتاح على هذا الجهاز فقط ويُرسل مباشرة إلى Anthropic. لا تستخدم هذه الصفحة على جهاز لا تثق به، ولا تشارك رابطاً أو نسخة تحتوي مفتاحك. أنشئ مفتاحاً من console.anthropic.com ← API Keys.'),
+    h('label', { class: 'p-meta' }, 'مزوّد الذكاء الاصطناعي'), sel,
+    keyLabel, keyInp,
+    h('button', { class: 'btn ghost sm', type: 'button', onclick: e => { const s2 = keyInp.type === 'password'; keyInp.type = s2 ? 'text' : 'password'; e.target.textContent = s2 ? 'إخفاء المفتاح' : 'إظهار المفتاح'; } }, 'إظهار المفتاح'),
+    h('label', { class: 'p-meta' }, 'النموذج (اتركه فارغاً للافتراضي)'), modelInp,
+    help,
+    h('div', { class: 'p-meta' }, 'يُحفظ المفتاح على هذا الجهاز فقط ويُرسل مباشرة إلى المزوّد. لا تستخدم هذه الصفحة على جهاز لا تثق به، ولا تشارك نسخة تحتوي مفتاحك.'),
     out,
-    h('div', { class: 'row', style: 'display:flex;gap:8px;margin-top:12px;flex-wrap:wrap' },
-      h('button', { class: 'btn primary', type: 'button', onclick: () => { if (persist()) { toast('تم حفظ الإعدادات', 'ok'); } } }, 'حفظ'),
-      h('button', { class: 'btn', type: 'button', onclick: () => { if (!keyInp.value.trim()) { out.className = 'notice err'; out.replaceChildren('أدخل المفتاح أولاً.'); return; } if (persist()) testConnection(cfg.key(), out); } }, 'حفظ واختبار الاتصال'),
+    h('div', { style: 'display:flex;gap:8px;margin-top:12px;flex-wrap:wrap' },
+      h('button', { class: 'btn primary', type: 'button', onclick: () => { if (persist()) toast('تم حفظ الإعدادات', 'ok'); } }, 'حفظ'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { if (!keyInp.value.trim()) { out.className = 'notice err'; out.replaceChildren('أدخل المفتاح أولاً.'); return; } if (persist()) testConnection(out); } }, 'حفظ واختبار الاتصال'),
       h('button', { class: 'btn ghost', type: 'button', onclick: () => { m.close(); settingsOpen = false; } }, 'إغلاق')),
   ]);
 }
