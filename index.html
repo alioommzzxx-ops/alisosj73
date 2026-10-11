@@ -142,13 +142,19 @@ select,.inp{border:1px solid var(--line);background:#fff;border-radius:var(--r-s
 
 /* modal + toast */
 .modal{position:fixed;inset:0;background:rgba(15,23,42,.35);backdrop-filter:blur(3px);display:grid;place-items:center;z-index:50;padding:16px}
-.modal-box{background:#fff;border-radius:var(--r-card);padding:20px;max-width:460px;width:100%;box-shadow:0 30px 60px -20px rgba(15,23,42,.4)}
+.modal-box{max-height:90vh;overflow:auto;background:#fff;border-radius:var(--r-card);padding:20px;max-width:460px;width:100%;box-shadow:0 30px 60px -20px rgba(15,23,42,.4)}
 .modal-box h3{margin:0 0 8px}
 .modal-box .inp{width:100%;margin:10px 0}
 .toasts{position:fixed;bottom:calc(16px + env(safe-area-inset-bottom));inset-inline:16px;display:flex;flex-direction:column;gap:8px;align-items:center;z-index:60;pointer-events:none}
 .toast{pointer-events:auto;background:var(--ink);color:#fff;padding:10px 16px;border-radius:14px;font-size:15px;max-width:520px;animation:rise .2s ease-out both}
 .toast.err{background:#b91c1c}.toast.ok{background:#15803d}
 .models{direction:ltr;text-align:left;font-family:var(--mono);font-size:12px;max-height:160px;overflow:auto;background:var(--bg);border-radius:10px;padding:8px;margin-top:8px}
+.guide-step{display:flex;gap:12px;margin:14px 0;align-items:flex-start}
+.guide-num{flex:none;width:28px;height:28px;border-radius:50%;background:var(--sky);color:#fff;display:grid;place-items:center;font-weight:700;font-size:14px}
+.guide-step b{display:block;margin-bottom:2px}
+.guide-step span{color:var(--ink2);font-size:14px;line-height:1.9}
+.guide-step code{direction:ltr;unicode-bidi:isolate;font-family:var(--mono);background:var(--sky-soft);color:var(--sky-d);padding:1px 6px;border-radius:6px;font-size:13px}
+.guide-tip{background:var(--warn-soft);color:#78350f;border-radius:12px;padding:10px 12px;font-size:14px;line-height:1.9;margin-top:10px}
 footer{text-align:center;color:var(--ink3);font-size:13px;padding:10px 16px 24px}
 @media(max-width:420px){.top-in{gap:4px;padding:8px 12px}.logo{font-size:17px;gap:8px}.logo-mark{width:32px;height:32px;font-size:18px}.nav{gap:0}.nav a,.nav button{padding:7px 8px;font-size:14px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
@@ -167,7 +173,7 @@ footer{text-align:center;color:var(--ink3);font-size:13px;padding:10px 16px 24px
 <main>
   <section id="view-home">
     <div class="hero">
-      <h1>اكتب فكرتك بالعربية،<br>ويبني Claude مشروعك الحقيقي</h1>
+      <h1>اكتب فكرتك بالعربية،<br>ويبني الذكاء الاصطناعي مشروعك الحقيقي</h1>
       <p class="sub">صِف ما تريد: نظام، متجر، لعبة، موقع. ستحصل على ملفات فعلية تعاينها وتعدّلها وتصدّرها.</p>
       <div id="key-warn" class="notice hidden"></div>
       <div class="idea glass">
@@ -177,6 +183,7 @@ footer{text-align:center;color:var(--ink3);font-size:13px;padding:10px 16px 24px
         <button type="button" class="btn primary go" id="go">أنشئ مشروعي بالذكاء الاصطناعي</button>
       </div>
       <div id="home-progress"></div>
+      <div style="text-align:center;margin-top:16px"><button type="button" class="btn ghost sm" id="btn-guide-home">كيف أنشر مشروعي على GitHub؟</button></div>
     </div>
   </section>
 
@@ -500,7 +507,7 @@ async function streamGenerate(prompt, projectId, onEvent, signal) {
     project.files[p] = c;
   }
   for (const p of out.deletes) if (p !== 'index.html') delete project.files[p];
-  if (out.unfinished || stop === 'max_tokens') notes.push('الناتج كان طويلاً وانقطع جزء منه؛ طُبّقت الملفات المكتملة فقط. اطلب من Claude إكمال الباقي من المحادثة.');
+  if (out.unfinished || stop === 'max_tokens') notes.push('الناتج كان طويلاً وانقطع جزء منه؛ طُبّقت الملفات المكتملة فقط. اكتب في المحادثة «أكمل ما تبقى من المشروع» ليكمله الذكاء الاصطناعي.');
   if (isNew && !project.files['index.html']) { onEvent({ type: 'error', message: 'لم يُنتج ملف index.html الأساسي (غالباً بسبب طول المشروع). جرّب فكرة أبسط.' }); return; }
   const changed = Object.keys(out.files).filter(p => p in project.files);
   const summary = out.summary || (changed.length ? 'تم تحديث: ' + changed.join('، ') : 'تم التعديل.');
@@ -665,7 +672,8 @@ function renderWorkspace() {
     h('a', { class: 'btn sm', href: '#/projects' }, 'رجوع'),
     ui.name,
     h('button', { class: 'btn sm', type: 'button', onclick: exportZip }, 'تصدير ZIP'),
-    h('button', { class: 'btn primary sm', type: 'button', onclick: exportPwa }, 'تصدير كتطبيق'));
+    h('button', { class: 'btn primary sm', type: 'button', onclick: exportPwa }, 'تصدير كتطبيق'),
+    h('button', { class: 'btn sm', type: 'button', onclick: showPublishGuide }, 'طريقة النشر'));
 
   const tabs = h('div', { class: 'tabs glass' },
     ...[['preview', 'المعاينة'], ['files', 'الملفات'], ['chat', 'المحادثة']].map(([t, l]) =>
@@ -762,7 +770,7 @@ function showPreviewErr() {
     h('button', { class: 'btn sm', type: 'button', onclick: () => {
       const text = `تظهر المعاينة هذا الخطأ: ${e}\nأصلح المشروع حتى يعمل بدون أخطاء.`;
       setTab('chat'); sendChat(text);
-    } }, 'اطلب من Claude إصلاحه'));
+    } }, 'اطلب من الذكاء الاصطناعي إصلاحه'));
 }
 window.addEventListener('message', ev => {
   if (!ui.frame || ev.source !== ui.frame.contentWindow || !ev.data) return;
@@ -831,10 +839,10 @@ async function deleteFile() {
 }
 
 /* ─── المحادثة ─── */
-const QUICK = ['غيّر الألوان إلى الأخضر', 'أضف صفحة تسجيل دخول', 'أضف لوحة تحكم', 'حسّن التصميم للموبايل'];
+const QUICK = ['أكمل ما تبقى من المشروع', 'غيّر الألوان إلى الأخضر', 'أضف صفحة تسجيل دخول', 'أضف لوحة تحكم', 'حسّن التصميم للموبايل'];
 function buildChatPanel() {
   ui.msgs = h('div', { class: 'msgs' });
-  ui.cinput = h('textarea', { placeholder: 'اكتب التعديل الذي تريده…', rows: 1, maxlength: 4000, 'aria-label': 'رسالة إلى Claude' });
+  ui.cinput = h('textarea', { placeholder: 'اكتب التعديل الذي تريده…', rows: 1, maxlength: 4000, 'aria-label': 'رسالة إلى الذكاء الاصطناعي' });
   ui.cinput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && isDesktop()) { e.preventDefault(); submitChat(); } });
   ui.cinput.addEventListener('input', () => { ui.cinput.style.height = 'auto'; ui.cinput.style.height = Math.min(140, ui.cinput.scrollHeight) + 'px'; });
   ui.sendBtn = h('button', { class: 'btn primary', type: 'button', onclick: submitChat }, 'إرسال');
@@ -842,7 +850,7 @@ function buildChatPanel() {
   return h('div', { class: 'panel glass chat', id: 'p-chat' }, ui.msgs, sugg, h('div', { class: 'cin' }, ui.cinput, ui.sendBtn));
 }
 function renderChat() {
-  ui.msgs.replaceChildren(h('div', { class: 'bub a' }, 'مشروعك جاهز. اكتب أي تعديل بالعربية، مثل تغيير الألوان أو إضافة صفحة أو إصلاح خطأ، وسأعدّل الملفات مباشرة.'));
+  ui.msgs.replaceChildren(h('div', { class: 'bub a' }, 'مشروعك جاهز. اكتب أي تعديل بالعربية، مثل تغيير الألوان أو إضافة صفحة أو إصلاح خطأ، وسأعدّل الملفات مباشرة. ولنشر المشروع على الإنترنت اضغط «طريقة النشر» بالأعلى.'));
   for (const m of state.project.messages || []) ui.msgs.append(h('div', { class: 'bub ' + (m.role === 'user' ? 'u' : 'a') }, m.text));
   ui.msgs.scrollTop = ui.msgs.scrollHeight;
 }
@@ -993,6 +1001,28 @@ async function exportPwa() {
   } catch (e) { toast('تعذّر إنشاء حزمة التطبيق: ' + e.message, 'err'); }
 }
 
+/* ═════════ دليل النشر على GitHub ═════════ */
+function showPublishGuide() {
+  const steps = [
+    ['أنشئ حساباً في GitHub', ['ادخل ', h('code', null, 'github.com'), ' واضغط Sign up وأنشئ حساباً مجانياً (إيميل + اسم مستخدم + كلمة مرور)، ثم فعّل الإيميل من الرسالة التي تصلك.']],
+    ['جهّز ملفات مشروعك', 'من هذه المنصة اضغط «تصدير ZIP» ثم فك الضغط على جهازك. ستجد index.html وملفات أخرى مثل style.css. وإن أردته يتثبت كتطبيق على الجوال اختر «تصدير كتطبيق» بدلاً منه.'],
+    ['أنشئ مستودعاً (Repository)', ['في GitHub اضغط علامة + بالأعلى ثم New repository. اكتب اسماً بالإنجليزي بدون مسافات مثل ', h('code', null, 'my-app'), '، واختر Public (مطلوب للاستضافة المجانية)، ثم اضغط Create repository.']],
+    ['ارفع الملفات', 'في صفحة المستودع اضغط «uploading an existing file» (أو Add file ثم Upload files). ارفع ملفات المشروع نفسها وليس المجلد الذي يحتويها، لأن index.html لازم يكون في الصفحة الرئيسية للمستودع. بعد اكتمال الرفع اضغط Commit changes.'],
+    ['فعّل GitHub Pages', 'ادخل Settings ثم Pages. تحت Build and deployment اختر Source: Deploy from a branch، ثم Branch: main و Folder: /(root) واضغط Save.'],
+    ['افتح رابط مشروعك', ['انتظر من دقيقة إلى ثلاث دقائق ثم حدّث صفحة Pages، فيظهر رابط مثل ', h('code', null, 'https://اسمك.github.io/my-app/'), ' وهذا رابط مشروعك، شاركه مع أي شخص.']],
+    ['حدّث المشروع لاحقاً', 'عدّل المشروع هنا وصدّره من جديد، ثم في المستودع اختر Add file ثم Upload files وارفع الملفات المعدلة بنفس أسمائها، واضغط Commit. يتحدث الموقع بعد دقيقة تقريباً.'],
+  ];
+  const m = modal([
+    h('h3', null, 'كيف أنشر مشروعي على GitHub؟'),
+    h('div', { class: 'p-meta' }, 'نشر مجاني عبر GitHub Pages، وتحصل على رابط يعمل من أي جهاز.'),
+    ...steps.map(([t, d], i) => h('div', { class: 'guide-step' }, h('div', { class: 'guide-num' }, String(i + 1)), h('div', null, h('b', null, t), h('span', null, d)))),
+    h('div', { class: 'guide-tip' }, 'من الجوال: افتح GitHub في المتصفح بوضع «موقع سطح المكتب» (Desktop site) ليظهر خيار رفع الملفات بشكل أوضح.'),
+    h('div', { class: 'guide-tip' }, 'مهم: لا ترفع مفتاح الذكاء الاصطناعي إلى GitHub أبداً. مفتاحك محفوظ في متصفحك فقط ولا يدخل في ملفات المشروع المصدَّرة.'),
+    h('div', { class: 'guide-tip' }, 'لتحويله إلى تطبيق أندرويد: بعد النشر ضع رابط موقعك في pwabuilder.com (يفضّل أن تصدّره بخيار «تصدير كتطبيق»).'),
+    h('button', { class: 'btn primary', type: 'button', style: 'margin-top:12px', onclick: () => m.close() }, 'فهمت'),
+  ]);
+}
+
 /* ═════════ الإعدادات واختبار الاتصال ═════════ */
 function updateKeyWarn() {
   const w = $('#key-warn');
@@ -1073,6 +1103,7 @@ function openSettings() {
   ]);
 }
 $('#btn-health').addEventListener('click', openSettings);
+$('#btn-guide-home').addEventListener('click', showPublishGuide);
 
 /* ═════════ البدء ═════════ */
 (function init() {
