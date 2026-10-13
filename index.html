@@ -8,7 +8,7 @@
 <title>نظام الحضور والغيابات — إعدادية النهرين</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <style>
 :root{
   --blue:#1456c8; --blue-d:#0b2f73; --blue-m:#3b7be8; --sky:#eaf2ff; --sky-2:#f5f9ff; --line:#d6e3f8;
@@ -548,9 +548,10 @@ const LTZ = 'Asia/Baghdad';
 /* ---------- التخزين ---------- */
 function idbOpen() {
   return new Promise((ok, no) => {
+    const tm = setTimeout(() => no(new Error('idb timeout')), 4000);
     const r = indexedDB.open('nahrain-attendance', 1);
     r.onupgradeneeded = () => r.result.createObjectStore('kv');
-    r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+    r.onsuccess = () => { clearTimeout(tm); ok(r.result); }; r.onerror = () => { clearTimeout(tm); no(r.error); }; r.onblocked = () => { clearTimeout(tm); no(new Error('blocked')); };
   });
 }
 async function idbGet() {
@@ -858,6 +859,14 @@ async function showLogin() {
     } catch (er) { $('#lerr').textContent = er.message; btn.disabled = false; }
   };
 }
+
+/* ---------- إظهار أي خطأ بدل الشاشة البيضاء ---------- */
+function showFatal(msg) {
+  const a = document.getElementById('app');
+  if (a && !a.innerHTML.trim()) a.innerHTML = '<div style="padding:24px;font-family:sans-serif;direction:rtl"><h3>تعذّر تشغيل النظام</h3><p style="direction:ltr;text-align:left;color:#c62828;word-break:break-word">' + String(msg).replace(/</g, '&lt;') + '</p><p>أرسل لي هذه الرسالة لأصلح المشكلة.</p></div>';
+}
+window.addEventListener('error', (e) => showFatal(e.message));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || e.reason));
 
 'use strict';
 /* ====================== لوحة اليوم / الحضور اليومي ====================== */
@@ -1462,6 +1471,4 @@ VIEWS.settings = function (root) {
   };
   async function users() {
     const us = await api('/users');
-    $('#ul').innerHTML = us.map((u) => `<div class="item"><div class="grow"><b>${esc(u.name)} ${u.active ? '' : '<span class="badge mute">معطّل</span>'}</b><small style="direction:ltr;text-align:right">${esc(u.username)}</small></div><span class="badge ${u.role === 'admin' ? 'info' : 'ok'}">${u.role === 'admin' ? 'مسؤول' : 'مراقب'}</span><button class="btn sm" data-e="${u.id}">تعديل</button>${u.id !== S.user.id ? `<button class="btn sm danger-t" data-d="${u.id}">حذف</button>` : ''}</div>`).join('');
-    $$('#ul [data-e]').forEach((b) => b.onclick = () => uform(us.find((x) => x.id === +b.dataset.e)));
-    $$('#ul [data-d]').forEach((b) => b.onclick = async () => { if (!(await confirmBox('حذف هذا المستخدم؟', 'حذف', true))) return; try { await api('/users/' + b.dataset.d, { method: 'DELETE' }); users(); toast('تم الحذف'); } catch (e) { toast(e.messa
+    $('#ul').innerHT
